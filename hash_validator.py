@@ -10,87 +10,109 @@ from google.cloud import storage
 app = FastAPI()
 
 class GenerateChecksumsRequest(BaseModel):
-    source_bucket: str
+    source_gcs_uri: str
     destination_bucket: str
     output_file_name: str
 
+class ChecksumItem(BaseModel):
+    filename: str
+    checksum: str
+
 class CompareChecksumsRequest(BaseModel):
-    first_checksum_bucket: str
-    first_checksum_file: str
-    second_checksum_bucket: str
-    second_checksum_file: str
+    first_checksums: List[ChecksumItem]
+    second_checksums: List[ChecksumItem]
 
 class GetChecksumsRequest(BaseModel):
     checksum_bucket: str
     checksum_file: str
 
-def decode_md5_hash(encoded_md5: str) -> str:
+def convert_space_separated_to_json(input_file):
     """
-    decode a base64-encoded md5 hash to a hexadecimal string.
+    Reads a space-separated file containing filename and checksum.
+    Returns a JSON-formatted string of the data.
+    
+    :param input_file: Path to the space-separated file.
+    :return: A JSON string representing the data.
     """
-    decoded = base64.b64decode(encoded_md5).hex()
-    return decoded
+    data = []
+    
+    with open(input_file, 'r') as infile:
+        for line in infile:
+            line = line.strip()
+            if line:
+                filename, checksum = line.split()
+                data.append({"filename": filename, "checksum": checksum})
+    
+    return json.dumps(data, indent=4)
+
+def parse_gcs_uri(uri: str):
+    """
+    Parse a GCS URI of the form 'gs://bucket_name/optional/path'
+    and return the (bucket_name, object_path_prefix).
+    """
+    if not uri.startswith("gs://"):
+        raise ValueError("Invalid GCS URI. Must start with gs://")
+
+    without_scheme = uri[len("gs://"):]
+    parts = without_scheme.split("/", 1)
+    bucket_name = parts[0]
+    prefix = parts[1] if len(parts) > 1 else ""
+    return bucket_name, prefix
+
+def decode_md5_hash(md5_hash_b64: str) -> str:
+    """
+    Decode an MD5 hash in base64-encoded format into its hex representation.
+    """
+    import base64
+    import binascii
+    decoded_bytes = base64.b64decode(md5_hash_b64)
+    return binascii.hexlify(decoded_bytes).decode("utf-8")
 
 @app.post("/generate-checksums")
 def generate_checksums(request: GenerateChecksumsRequest):
     """
-    generate md5 checksums for all objects in the specified source bucket
-    and write them to a file in the specified destination bucket. The file
-    will contain two columns: filename and checksum.
+    Generate md5 checksums for all objects under the given GCS URI
+    (e.g. gs://my-bucket/test_dir). Writes them to a CSV file in
+    the specified destination bucket.
+
+    The output file will contain two columns: filename and checksum.
     """
     storage_client = storage.Client()
 
-    source_bucket = storage_client.bucket(request.source_bucket)
+    source_bucket_name, prefix = parse_gcs_uri(request.source_gcs_uri)
+    source_bucket = storage_client.bucket(source_bucket_name)
     destination_bucket = storage_client.bucket(request.destination_bucket)
 
-    blobs = source_bucket.list_blobs()
+    blobs = source_bucket.list_blobs(prefix=prefix)
     output_buffer = io.StringIO()
     writer = csv.writer(output_buffer, delimiter=",")
-    
+
     for blob in blobs:
         if not blob.md5_hash:
             raise HTTPException(
                 status_code=500,
-                detail=f"blob {blob.name} has no md5 hash available."
+                detail=f"Blob {blob.name} has no md5 hash available."
             )
         md5_hex = decode_md5_hash(blob.md5_hash)
-        writer.writerow([blob.name, md5_hex])
+
+        # Remove the prefix from the filename so we don't include 'test_dir/'.
+        relative_name = blob.name[len(prefix):].lstrip("/")
+        writer.writerow([relative_name, md5_hex])
 
     output_blob = destination_bucket.blob(request.output_file_name)
     output_blob.upload_from_string(output_buffer.getvalue())
 
-    return {"message": "checksum file created successfully."}
+    return {"message": "Checksum file created successfully."}
 
 @app.post("/compare-checksums")
 def compare_checksums(request: CompareChecksumsRequest) -> Dict[str, List[str]]:
     """
-    with lists of files that have matching checksums, mismatched checksums,
-    compare two checksum files (by filename) in gcs. return a dictionary
-    and files found in only one of the lists.
+    Compare two sets of filename/checksum pairs provided directly as JSON.
+    Returns a dictionary with filenames that match, mismatch,
+    and filenames found only in the first or second list.
     """
-    storage_client = storage.Client()
-
-    first_bucket = storage_client.bucket(request.first_checksum_bucket)
-    second_bucket = storage_client.bucket(request.second_checksum_bucket)
-
-    first_blob = first_bucket.blob(request.first_checksum_file)
-    second_blob = second_bucket.blob(request.second_checksum_file)
-
-    first_data = first_blob.download_as_text()
-    second_data = second_blob.download_as_text()
-
-    first_checksums = {}
-    second_checksums = {}
-
-    first_reader = csv.reader(io.StringIO(first_data), delimiter=",")
-    for row in first_reader:
-        filename, checksum = row
-        first_checksums[filename] = checksum
-
-    second_reader = csv.reader(io.StringIO(second_data), delimiter=",")
-    for row in second_reader:
-        filename, checksum = row
-        second_checksums[filename] = checksum
+    first_checksums = {item.filename: item.checksum for item in request.first_checksums}
+    second_checksums = {item.filename: item.checksum for item in request.second_checksums}
 
     matching = []
     mismatching = []
